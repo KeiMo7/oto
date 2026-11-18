@@ -216,6 +216,78 @@ myPlayer.SetBufferSize(newBufferSize)
 
 `NewPlayer` returns a `*oto.Player`, which has functions like `SetBufferSize` and `Seek`.
 
+### Runtime observability
+
+`NewPlayer` keeps its existing behavior: it enables no callbacks, timers,
+additional goroutines, or new log output. Runtime observation is opt-in through
+`NewPlayerWithOptions`. Its zero configuration is equivalent to `NewPlayer`.
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+player, err := otoContext.NewPlayerWithOptions(reader, &oto.NewPlayerOptions{
+    Observation: &oto.ObservationOptions{
+        Context:          ctx,
+        ProgressInterval: 500 * time.Millisecond,
+        OnProgress: func(progress oto.Progress) {
+            if progress.Total >= 0 {
+                remaining := progress.Total - progress.Position
+                log.Printf("remaining bytes: %d", remaining)
+            } else {
+                log.Printf("stream position: %d", progress.Position)
+            }
+        },
+        OnError: func(eventError oto.PlayerError) {
+            log.Printf("kind=%s op=%s position=%d", eventError.Kind, eventError.Operation, eventError.Position)
+        },
+        OnUnderrun: func(underrun oto.Underrun) {
+            log.Printf("underrun at mix frame %d", underrun.MixFrame)
+        },
+        Logger: slog.Default(),
+    },
+})
+if err != nil {
+    panic(err)
+}
+player.Play()
+```
+
+The default values are the existing behavior: `ProgressInterval` is `0`
+(disabled), `Context`, callbacks, and `Logger` are `nil`. Existing code does not
+need to migrate. To opt in, replace `NewPlayer` with `NewPlayerWithOptions` as
+above; to opt out again, pass `nil` options or omit `Observation`.
+
+Progress positions count source bytes accepted for playback. `Total` and
+`TotalFrames` are `-1` for streams whose size cannot be determined. Callbacks
+run outside the mixing path, and only the latest pending progress or underrun
+is retained, so a slow callback cannot grow memory without bound. An initial
+snapshot and a final snapshot are also delivered. A panic in a callback is
+logged and does not stop playback.
+
+Cancellation marks `Player.Err()` with `ErrorKindCanceled` and wraps
+`context.Canceled`, so callers can distinguish cancellation from failure with
+`errors.Is`. Sources implementing `io.Closer`, `SetReadDeadline`, or
+`CancelRead` are interrupted automatically. For other blocking sources, set
+`ObservationOptions.InterruptRead`; a plain `io.Reader` cannot be interrupted
+generically. `Player.Cancel()` is also available without a context. Cancellation
+does not create or remove temporary files, and waits for the in-flight source
+operation after interrupting it.
+
+`Context.ErrorInfo()` classifies driver initialization and runtime errors as a
+device or dependency error while leaving `Context.Err()` unchanged. The
+library's own lifecycle and failure logs contain numeric state and error
+classification only; source paths, URLs, and common credential fields are
+redacted. Lifecycle events use `Info`, failures use `Error`, and per-buffer
+underruns use `Debug`.
+
+Observation does not change the existing player lock order or the device-level
+playback API. Each observed player has at most one sampler and one callback
+dispatcher; callbacks for one player are serialized, while different players
+can deliver callbacks concurrently. If cancellation races with a source
+failure, the terminal cause that is recorded first is retained. The new paths
+are covered by `go test -race ./internal/mux .`.
+
 ## Crosscompiling
 
 Crosscompiling to macOS, Windows, Linux or BSD is as easy as setting `GOOS=darwin`, `GOOS=windows`,

@@ -15,6 +15,7 @@
 package oto
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/ebitengine/oto/v3/internal/mux"
@@ -95,7 +96,40 @@ func (p *Player) UnplayedSize() int {
 // and Err keeps returning the same error.
 func (p *Player) Err() error {
 	if err := p.player.Err(); err != nil {
+		var eventError *mux.PlayerError
+		if errors.As(err, &eventError) {
+			converted := fromMuxPlayerError(eventError)
+			return &converted
+		}
 		return fmt.Errorf("oto: audio error: %w", err)
+	}
+	return nil
+}
+
+// Progress returns the latest sampled progress. ok is false when observation is
+// disabled or no sample has been taken yet.
+func (p *Player) Progress() (Progress, bool) {
+	progress, ok := p.player.Progress()
+	if !ok {
+		return Progress{}, false
+	}
+	return fromMuxProgress(progress), true
+}
+
+// Cancel cancels playback and waits for an in-flight source operation to
+// finish. Err reports a canceled error after cancellation.
+//
+// If the source can block in Read and cannot be interrupted, set
+// ObservationOptions.InterruptRead. Sources implementing io.Closer,
+// SetReadDeadline, or CancelRead are interrupted automatically.
+func (p *Player) Cancel() error {
+	if err := p.player.Cancel(); err != nil {
+		var eventError *mux.PlayerError
+		if errors.As(err, &eventError) {
+			converted := fromMuxPlayerError(eventError)
+			return &converted
+		}
+		return err
 	}
 	return nil
 }
@@ -118,10 +152,15 @@ func (p *Player) Seek(offset int64, whence int) (int64, error) {
 
 // Close implements io.Closer.
 //
-// Close does nothing and always returns nil.
+// For a player created without observation, Close does nothing and returns nil.
+// For a player created with NewPlayerWithOptions, Close releases the player and
+// stops its observation callbacks.
 //
 // Deprecated: as of v3.4, you don't have to call Close.
 func (p *Player) Close() error {
+	if p.player.ObservationEnabled() {
+		return p.player.Close()
+	}
 	// (*mux.Player).Close() is called by the finalizer. Let's rely on it.
 	return nil
 }

@@ -17,6 +17,7 @@
 package mux
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -65,6 +66,9 @@ type Mux struct {
 
 	// mixed counts the samples ReadFloat32s has mixed.
 	mixed atomic.Int64
+
+	// nextPlayerID is the ID of the next observable player.
+	nextPlayerID atomic.Uint64
 
 	// playedMu guards the driver's last report: frame playedFrame of the mix is
 	// played at playedAt, reported at reportedAt, while playedKnown is set.
@@ -253,7 +257,10 @@ func (m *Mux) ReadFloat32s(buf []float32) {
 	}
 	start := m.mixed.Load()
 	for _, p := range players {
-		p.readBufferAndAdd(buf, start)
+		_, underrun, ok := p.readBufferAndAdd(buf, start)
+		if ok {
+			p.observation.setUnderrun(underrun)
+		}
 	}
 	m.mixed.Add(int64(len(buf)))
 	m.signal()
@@ -284,6 +291,7 @@ const (
 type playerImpl struct {
 	mux        *Mux
 	src        io.Reader
+	id         uint64
 	prevVolume float64
 	volume     float64
 	state      playerState
@@ -316,6 +324,16 @@ type playerImpl struct {
 	// The result of a read that started at an older generation is stale and must be discarded.
 	srcGen int
 
+	// position and total are source byte positions for observation. They are
+	// updated only when observation is enabled.
+	position int64
+	total    int64
+
+	// canceled distinguishes a cancellation from a source failure.
+	canceled bool
+
+	observation *playerObservation
+
 	// sent holds the spans of the mix this player's data went into, oldest
 	// first, while they may be unplayed.
 	sent []sentSpan
@@ -331,25 +349,106 @@ type sentSpan struct {
 }
 
 func (m *Mux) NewPlayer(src io.Reader) *Player {
+	return m.newPlayer(src, nil)
+}
+
+// NewPlayerWithOptions creates a player with optional runtime observation.
+// With nil options, it behaves like NewPlayer.
+func (m *Mux) NewPlayerWithOptions(src io.Reader, options *NewPlayerOptions) (*Player, error) {
+	if options == nil || options.Observation == nil {
+		return m.NewPlayer(src), nil
+	}
+	if options.Observation.ProgressInterval < 0 {
+		return nil, fmt.Errorf("mux: progress interval must not be negative: %s", options.Observation.ProgressInterval)
+	}
+	if ctx := options.Observation.Context; ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("mux: player context is already done: %w", err)
+		}
+	}
+	return m.newPlayer(src, options.Observation), nil
+}
+
+func (m *Mux) newPlayer(src io.Reader, observationOptions *ObservationOptions) *Player {
+	position, total := int64(0), int64(-1)
+	id := uint64(0)
+	if observationOptions != nil {
+		id = m.nextPlayerID.Add(1)
+		position, total = sourceSize(src)
+	}
 	p := &playerImpl{
 		mux:        m,
 		src:        src,
+		id:         id,
 		prevVolume: 1,
 		volume:     1,
 		bufferSize: m.defaultBufferSize(),
+		position:   position,
+		total:      total,
 	}
 	p.readCond = sync.NewCond(&p.m)
 	pl := &Player{
 		p: p,
 	}
 	pl.cleanup = runtime.AddCleanup(pl, func(p *playerImpl) {
-		_ = p.Close()
+		_ = p.closeAndFinish("closed")
 	}, pl.p)
+	if observationOptions != nil {
+		p.observation = newPlayerObservation(p.id, p.total, observationOptions)
+		p.observation.start(p)
+	}
 	return pl
+}
+
+func sourceSize(src io.Reader) (position, total int64) {
+	total = -1
+	if sizer, ok := src.(interface{ Size() int64 }); ok {
+		if size := sizer.Size(); size >= 0 {
+			total = size
+		}
+	}
+	seeker, ok := src.(io.Seeker)
+	if !ok {
+		return 0, total
+	}
+
+	current, err := seeker.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, total
+	}
+	position = current
+	end, err := seeker.Seek(0, io.SeekEnd)
+	if err == nil && end >= 0 {
+		total = end
+	}
+	if _, err := seeker.Seek(current, io.SeekStart); err != nil {
+		return 0, -1
+	}
+	return position, total
 }
 
 func (p *Player) Err() error {
 	return p.p.Err()
+}
+
+// Progress returns the latest sampled progress. ok is false when observation
+// is disabled or no sample has been taken yet.
+func (p *Player) Progress() (Progress, bool) {
+	if p.p.observation == nil {
+		return Progress{}, false
+	}
+	return p.p.observation.latestProgress()
+}
+
+// Cancel cancels the player. It marks the player as canceled before waiting for
+// an in-flight source operation, so Err can report the cancellation promptly.
+func (p *Player) Cancel() error {
+	return p.p.cancel(context.Canceled)
+}
+
+// ObservationEnabled reports whether runtime observation was enabled.
+func (p *Player) ObservationEnabled() bool {
+	return p.p.observation != nil
 }
 
 func (p *playerImpl) Err() error {
@@ -496,7 +595,9 @@ func (p *playerImpl) Seek(offset int64, whence int) (int64, error) {
 	// Check if the source implements io.Seeker.
 	s, ok := p.src.(io.Seeker)
 	if !ok {
-		return 0, errors.New("mux: the source must implement io.Seeker")
+		err := errors.New("mux: the source must implement io.Seeker")
+		p.reportOperationError(ErrorKindUnsupported, "seek", err)
+		return 0, err
 	}
 
 	defer p.mux.signal()
@@ -505,7 +606,45 @@ func (p *playerImpl) Seek(offset int64, whence int) (int64, error) {
 	defer p.finishSeek()
 
 	// A source may block in Seek. Do not hold the player lock needed by the mixer.
-	return s.Seek(offset, whence)
+	position, err := s.Seek(offset, whence)
+	if err != nil {
+		if canceledErr := p.canceledError(); canceledErr != nil {
+			return position, canceledErr
+		}
+		p.reportOperationError(ErrorKindSeek, "seek", err)
+		return position, err
+	}
+	p.recordPosition(position)
+	return position, nil
+}
+
+func (p *playerImpl) recordPosition(position int64) {
+	if p.observation == nil {
+		return
+	}
+
+	p.m.Lock()
+	defer p.m.Unlock()
+	if p.state == playerClosed || p.canceled {
+		return
+	}
+	p.position = position
+}
+
+func (p *playerImpl) canceledError() error {
+	p.m.Lock()
+	defer p.m.Unlock()
+	if !p.canceled {
+		return nil
+	}
+	return p.err
+}
+
+func (p *playerImpl) reportOperationError(kind ErrorKind, operation string, err error) {
+	if p.observation == nil {
+		return
+	}
+	p.observation.setError(p.newPlayerError(kind, operation, err, false))
 }
 
 // prepareSeek discards buffered data and waits for an ongoing Read without
@@ -680,7 +819,7 @@ func (p *playerImpl) recordSent(start, end int64) {
 
 func (p *Player) Close() error {
 	p.cleanup.Stop()
-	return p.p.Close()
+	return p.p.closeAndFinish("closed")
 }
 
 func (p *playerImpl) Close() error {
@@ -689,6 +828,16 @@ func (p *playerImpl) Close() error {
 
 	p.waitForSeekImpl()
 	return p.closeImpl()
+}
+
+func (p *playerImpl) closeAndFinish(status string) error {
+	p.m.Lock()
+	defer p.m.Unlock()
+
+	p.waitForSeekImpl()
+	err := p.closeImpl()
+	p.finishObservationLocked(status, nil)
+	return err
 }
 
 func (p *playerImpl) closeImpl() error {
@@ -707,6 +856,133 @@ func (p *playerImpl) closeImpl() error {
 	return p.err
 }
 
+func (p *playerImpl) cancel(cause error) error {
+	p.m.Lock()
+	if p.state == playerClosed {
+		err := p.err
+		p.m.Unlock()
+		p.finishObservation("canceled", nil)
+		return err
+	}
+
+	p.canceled = true
+	p.srcErr = nil
+	canceledErr := p.newPlayerErrorLocked(ErrorKindCanceled, "cancel", cause, true)
+	p.err = canceledErr
+	p.closeImpl()
+	observation := p.observation
+	src := p.src
+	p.m.Unlock()
+
+	p.mux.signal()
+
+	if observation != nil {
+		observation.interruptSource()
+	}
+	p.interruptSource(src)
+
+	// A failed or canceled Read or Seek is discarded by finishSourceRead or
+	// Seek. Wait for it so cancellation does not leave source-owned resources in
+	// use after returning.
+	p.m.Lock()
+	for p.reading || p.seeking {
+		p.readCond.Wait()
+	}
+	p.m.Unlock()
+
+	p.finishObservation("canceled", canceledErr)
+	return canceledErr
+}
+
+func (p *playerImpl) interruptSource(src io.Reader) {
+	if src == nil {
+		return
+	}
+	if closer, ok := src.(io.Closer); ok {
+		_ = closer.Close()
+		return
+	}
+	if canceler, ok := src.(interface{ CancelRead() error }); ok {
+		_ = canceler.CancelRead()
+		return
+	}
+	if deadliner, ok := src.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = deadliner.SetReadDeadline(time.Now())
+	}
+}
+
+func (p *playerImpl) newPlayerError(kind ErrorKind, operation string, err error, fatal bool) *PlayerError {
+	p.m.Lock()
+	defer p.m.Unlock()
+	return p.newPlayerErrorLocked(kind, operation, err, fatal)
+}
+
+func (p *playerImpl) newPlayerErrorLocked(kind ErrorKind, operation string, err error, fatal bool) *PlayerError {
+	position, total := p.position, p.total
+	if total < 0 {
+		total = -1
+	}
+	detail := ""
+	if err != nil {
+		detail = SanitizeErrorText(err.Error())
+	}
+	return &PlayerError{
+		Kind:          kind,
+		Operation:     operation,
+		Position:      position,
+		Total:         total,
+		BufferedBytes: p.buffered(),
+		BufferSize:    p.bufferSize,
+		Fatal:         fatal,
+		Detail:        detail,
+		Err:           err,
+		At:            time.Now(),
+	}
+}
+
+func (p *playerImpl) finishObservation(status string, eventError *PlayerError) {
+	p.m.Lock()
+	defer p.m.Unlock()
+	p.finishObservationLocked(status, eventError)
+}
+
+func (p *playerImpl) finishObservationLocked(status string, eventError *PlayerError) {
+	if p.observation == nil {
+		return
+	}
+	snapshot := p.progressSnapshotLocked()
+	p.observation.finish(status, eventError, &snapshot)
+}
+
+func (p *playerImpl) progressSnapshot() *Progress {
+	p.m.Lock()
+	defer p.m.Unlock()
+	if p.observation == nil {
+		return nil
+	}
+	snapshot := p.progressSnapshotLocked()
+	return &snapshot
+}
+
+func (p *playerImpl) progressSnapshotLocked() Progress {
+	frameBytes := int64(p.mux.channelCount * p.mux.format.ByteLength())
+	frames, totalFrames := int64(0), int64(-1)
+	if frameBytes > 0 {
+		frames = p.position / frameBytes
+		if p.total >= 0 {
+			totalFrames = p.total / frameBytes
+		}
+	}
+	return Progress{
+		PlayerID:    p.id,
+		Position:    p.position,
+		Total:       p.total,
+		Frames:      frames,
+		TotalFrames: totalFrames,
+		At:          time.Now(),
+	}
+}
+
 func (p *playerImpl) buffered() int {
 	return len(p.buf) - p.readPos
 }
@@ -720,13 +996,13 @@ func (p *playerImpl) drained() bool {
 
 // readBufferAndAdd adds the player's buffered data to buf, which goes into the
 // mix from sample start.
-func (p *playerImpl) readBufferAndAdd(buf []float32, start int64) int {
+func (p *playerImpl) readBufferAndAdd(buf []float32, start int64) (int, Underrun, bool) {
 	p.m.Lock()
 	defer p.m.Unlock()
 
 	// Do not advance the volume ramp while seeking has discarded the buffer.
 	if p.seeking || p.state != playerPlay {
-		return 0
+		return 0, Underrun{}, false
 	}
 
 	format := p.mux.format
@@ -799,8 +1075,30 @@ func (p *playerImpl) readBufferAndAdd(buf []float32, start int64) int {
 		p.mux.removePlayer(p)
 	}
 	p.reportSourceErrorIfDrainedImpl()
+	if p.drained() {
+		p.finishObservationLocked("completed", nil)
+	}
 
-	return n
+	if p.observation != nil && p.observation.wantsUnderrun && p.state == playerPlay && n < len(buf) {
+		mixSample := start + int64(n)
+		requestedSamples := len(buf)
+		mixedSamples := n
+		underrun := Underrun{
+			PlayerID:        p.id,
+			MixSample:       mixSample,
+			MixFrame:        mixSample / int64(channelCount),
+			RequestedFrames: requestedSamples / channelCount,
+			MixedFrames:     mixedSamples / channelCount,
+			ShortfallFrames: (requestedSamples - mixedSamples) / channelCount,
+			SourcePosition:  p.position,
+			Total:           p.total,
+			BufferedBytes:   p.buffered(),
+			At:              time.Now(),
+		}
+		return n, underrun, true
+	}
+
+	return n, Underrun{}, false
 }
 
 func (p *playerImpl) canReadSourceToBuffer() bool {
@@ -870,6 +1168,9 @@ func (p *playerImpl) finishSourceRead(buf *[]byte, gen, n int, err error) int {
 	}
 
 	p.buf = append(p.buf, (*buf)[:n]...)
+	if p.observation != nil && n > 0 {
+		p.position += int64(n)
+	}
 	switch {
 	case err == io.EOF:
 		p.eof = true
@@ -879,6 +1180,7 @@ func (p *playerImpl) finishSourceRead(buf *[]byte, gen, n int, err error) int {
 				p.state = playerPaused
 			}
 			p.mux.removePlayer(p)
+			p.finishObservationLocked("completed", nil)
 		}
 	case err != nil:
 		// The data read before the error, including the data returned together with it, is mixed first.
@@ -908,8 +1210,10 @@ func (p *playerImpl) setErrorImpl(err error) {
 	if p.err != nil {
 		panic("mux: the player's error is already set")
 	}
+	eventError := p.newPlayerErrorLocked(ErrorKindSourceRead, "read_source", err, true)
 	p.err = err
 	p.closeImpl()
+	p.finishObservationLocked("failed", eventError)
 }
 
 func (p *playerImpl) returnBufferToPool() {
